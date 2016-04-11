@@ -2,9 +2,10 @@ from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import IPAddr, EthAddr
 import pox.lib.packet as pkt
-import collections
+import threading
 
 log = core.getLogger()
+IDLE_TIMEOUT = 60
 
 class Load_Balancer(object):
     """ Controller as a load balancer """
@@ -14,7 +15,6 @@ class Load_Balancer(object):
         self.connection = connection
         # This binds our PacketIn event listener
         connection.addListeners(self)
-        self.mac_to_port = {}
         self.index = 0
         self.flow_map = {}
         self.mac = EthAddr("01:01:01:01:01:01")
@@ -35,6 +35,10 @@ class Load_Balancer(object):
                 + " port:" + str(server['port']) 
         self.index = (self.index + 1) % len(self.servers)
         return server;
+
+    def remove_mapping(self, client_mac):
+        del self.flow_map[client_mac]
+
 
     def resend_packet (self, packet_in, out_port):
         """
@@ -111,7 +115,7 @@ class Load_Balancer(object):
             packet = pkt.ethernet(
                     type = pkt.ethernet.ARP_TYPE,
                     src = self.mac,
-                    dst = pkt.ETHER_BROADCAST)
+                    dst = arp.hwsrc)
             packet.payload = pkt.arp(
                     opcode = pkt.arp.REPLY,
                     hwtype = pkt.arp.HW_TYPE_ETHERNET,
@@ -150,6 +154,8 @@ class Load_Balancer(object):
 
         msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
                               # data=packet_in,
+                              idle_timeout = IDLE_TIMEOUT,
+                              hard_timeout = of.OFP_FLOW_PERMANENT,
                               actions=actions,
                               match=match)
         self.connection.send(msg) 
@@ -157,9 +163,20 @@ class Load_Balancer(object):
     def handle_client_req(self, packet_in, packet, tcp_seg):
         """
         """
+        ip_packet = packet.find('ipv4')
         src_mac = packet.src
+        src_ip = ip_packet.srcip
+
+        # flow already registered, not expried yet
+        if src_mac in self.flow_map:
+            return
+
         # pick server
         server = self.pick_server()
+
+        # register flow, set expire time
+        self.flow_map[src_mac] = server
+        threading.Timer(IDLE_TIMEOUT, self.remove_mapping, [src_mac]).start()
 
         # set address of real server
         actions = []
@@ -168,11 +185,17 @@ class Load_Balancer(object):
         # dst ip address
         actions.append(of.ofp_action_nw_addr.set_dst(server['ip']))
         actions.append(of.ofp_action_output(port = of.OFPP_NORMAL))
-        match = of.ofp_match.from_packet(packet)
+        # match = of.ofp_match.from_packet(packet)
+        match = of.ofp_match(dl_src=src_mac,
+                             dl_dst=self.mac,
+                             nw_src=src_ip
+                             nw_src=self.ip)
 
         # install to flow table
         msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
                               # data=packet_in,
+                              idle_timeout = IDLE_TIMEOUT,
+                              hard_timeout = of.OFP_FLOW_PERMANENT,
                               actions=actions,
                               match=match)
         self.connection.send(msg) 
