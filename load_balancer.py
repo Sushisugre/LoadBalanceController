@@ -37,6 +37,7 @@ class Load_Balancer(object):
         return server;
 
     def remove_mapping(self, client_mac):
+        """ Remove mappind entry when flow expired """
         del self.flow_map[client_mac]
 
 
@@ -76,38 +77,23 @@ class Load_Balancer(object):
 
         self.connection.send(msg)
 
-
-    def forward_packet (self, packet_in, out_port):
-        """
-        Instructs the switch to resend a packet      
-        "packet_in" is the ofp_packet_in object the switch had 
-        sent to the controller due to a table-miss.
-        """
-        msg = of.ofp_packet_out()
-        msg.data = packet_in
-        action = of.ofp_action_output(port = out_port)
-        msg.actions.append(action)
-        self.connection.send(msg)
-
     def handle_arp(self, packet, in_port):
+        """
+        Controller Handles ARP packet
+        """
         arp = packet.find("arp")
         if packet.payload.opcode == arp.REPLY: # Server or client reply
+            host = {
+                'ip': arp.protosrc,
+                'mac': arp.hwsrc,
+                'port': in_port
+            }
             if arp.protosrc in self.server_ips:
                 log.debug("Server ARP reply :"+ str(arp.hwsrc));
-                server = {
-                    'ip': arp.protosrc,
-                    'mac': arp.hwsrc,
-                    'port': in_port
-                }
-                self.servers.append(server)
+                self.servers.append(host)
             else:
                 log.debug("Client ARP reply :"+ str(arp.hwsrc));
-                client = {
-                    'ip': arp.protosrc,
-                    'mac': arp.hwsrc,
-                    'port': in_port
-                }
-                self.clients.append(client)
+                self.clients.append(host)
 
         elif packet.payload.opcode == arp.REQUEST: # Request for balancer
             log.debug("ARP request for Load balancer");
@@ -130,6 +116,9 @@ class Load_Balancer(object):
             self.connection.send(msg)
 
     def handle_tcp(self, packet, packet_in, inport):
+        """
+        Handle TCP/IP packet
+        """
         ip_packet = packet.find('ipv4')
         tcp_seg = ip_packet.find('tcp')
 
@@ -162,6 +151,7 @@ class Load_Balancer(object):
 
     def handle_client_req(self, packet_in, packet, tcp_seg):
         """
+        Handle client request, if there's valid flow entry, use the 
         """
         ip_packet = packet.find('ipv4')
         src_mac = packet.src
@@ -169,14 +159,22 @@ class Load_Balancer(object):
 
         # flow already registered, not expried yet
         if src_mac in self.flow_map:
+            # extend the expiration time after match
+            flow_map[src_mac]['timer'].cancel()
+            flow_map[src_mac]['timer'] = threading.Timer(IDLE_TIMEOUT, self.remove_mapping, [src_mac])
+            flow_map[src_mac]['timer'].start()
             return
 
-        # pick server
+        # pick new server
         server = self.pick_server()
+        timer = threading.Timer(IDLE_TIMEOUT, self.remove_mapping, [src_mac])
 
         # register flow, set expire time
-        self.flow_map[src_mac] = server
-        threading.Timer(IDLE_TIMEOUT, self.remove_mapping, [src_mac]).start()
+        self.flow_map[src_mac] = {
+            'server': server,
+            'timer': timer
+        }
+        timer.start()
 
         # set address of real server
         actions = []
@@ -187,9 +185,7 @@ class Load_Balancer(object):
         actions.append(of.ofp_action_output(port = of.OFPP_NORMAL))
         # match = of.ofp_match.from_packet(packet)
         match = of.ofp_match(dl_src=src_mac,
-                             dl_dst=self.mac,
-                             nw_src=src_ip
-                             nw_src=self.ip)
+                             dl_dst=self.mac)
 
         # install to flow table
         msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
@@ -202,6 +198,9 @@ class Load_Balancer(object):
         
 
     def _handle_PacketIn (self, event):
+        """
+        Handle packet in event
+        """
         packet_in = event.ofp 
         packet = event.parsed
         src_mac = packet.src
@@ -232,9 +231,6 @@ class Load_Balancer(object):
 def launch (balancer_addr, server_addrs):
     balancer = IPAddr(balancer_addr)
     server_ips = [IPAddr(x) for x in server_addrs.split(",")]
-    # servers = {}
-    # for server in [IPAddr(x) for x in server_addrs.split(",")]:
-    #     servers[server] = None
 
     def start_switch (event):
         log.debug("Controlling %s" % (event.connection))
